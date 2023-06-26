@@ -2,17 +2,52 @@ import copy
 import logging
 import multiprocessing as mp
 import os
-import random
 import threading
 import time
-import tomllib
 from queue import Queue
-
+import numpy as np
+import pandas as pd
 import pygame
+import math
 
 from csv_writer import CsvWriter
 
 os.environ["SDL_VIDEO_WINDOW_POS"] = "%d,%d" % (0, 0)
+
+WIDTH = 640
+HEIGHT = 128
+HZ = 60
+PIXEL_SIZE_CM = 0.4
+D = 25  # distance to screen in cm
+
+
+def find_rv_timecourse(theta_min_in, theta_max_in, r_v_ratio, delta_t):
+    display_frequency = 1 / delta_t  # in Hz
+
+    theta_max = np.deg2rad(theta_max_in)
+    theta_min = np.deg2rad(theta_min_in)
+
+    min_collision_time = r_v_ratio / np.tan(
+        theta_max / 2
+    )  # time to collision for disc at theta_max.
+    max_collision_time = r_v_ratio / np.tan(
+        theta_min / 2
+    )  # time to collision for disc at theta_min.
+    total_collision_time = max_collision_time - min_collision_time
+    num_frames = math.ceil(
+        total_collision_time * display_frequency
+    )  # round up so we cover at least theta_min to theta_max.
+
+    time_theta_array = np.zeros((num_frames, 2))
+
+    time_theta_array[:, 0] = np.arange(
+        -min_collision_time, -max_collision_time, -delta_t
+    )
+    time_theta_array[:, 1] = (
+        (180 / np.pi) * 2 * np.arctan2(r_v_ratio, (np.abs(time_theta_array[:, 0])))
+    )
+
+    return time_theta_array
 
 
 def stimuli(
@@ -37,7 +72,6 @@ def stimuli(
     pygame.init()
 
     # initialize screen
-    WIDTH, HEIGHT = 640, 128
     screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.NOFRAME)
 
     # initialize clock
@@ -51,42 +85,14 @@ def stimuli(
         bg = pygame.Surface((WIDTH, HEIGHT))
         bg.fill("white")
 
-    loom_stim = params["stim_params"]["looming"]["active"]
+    loom_stim = params["stim_params"]["looming"]
 
     # looming stimulus
-    if loom_stim:
-        circle_color = params["stim_params"]["looming"]["color"]
-
-        circle_duration = params["stim_params"]["looming"]["duration"]
-        if circle_duration == "random":
-            random_duration = True
-            possible_durations = [300, 500, 700, 900]
-        else:
-            random_duration = False
-
-        # convert the max radius to pixels
-        circle_max_radius = params["stim_params"]["looming"]["max_radius"]
-
-        if circle_max_radius == "random":
-            random_radius = True
-            possible_radius = [16, 32, 48, 64]
-        else:
-            random_radius = False
-            circle_max_radius = int(circle_max_radius / 2 * HEIGHT)
-
-            # calculate the change in radius per frame
-            F = circle_duration / (1000 / 60)
-            dR = circle_max_radius / F
-
-        # check if the circle position is random
-        circle_position = params["stim_params"]["looming"]["position"]
-        if circle_position == "random":
-            random_position = True
-            possible_positions = list(range(0, WIDTH, 32))
-        else:
-            random_position = False
-
-        radius = 0
+    if loom_stim["active"]:
+        looms_df = define_looming(
+            loom_stim["duration"], loom_stim["radius"], loom_stim["position"]
+        )
+        circle_color = loom_stim["color"]
         start_loom = False
 
     # wait barrier
@@ -113,46 +119,37 @@ def stimuli(
             if loom_stim:
                 # test if the trigger event is set
                 if trigger and not start_loom:
-                    start_loom = True  # set the start_loom flag to True
                     logging.debug("Got data from trigger event")
+                    start_loom = True  # set the start_loom flag to True
 
                     data["stimulus_start_time"] = time.time()
 
-                    # check if random duration
-                    if random_duration:
-                        circle_duration = random.choice(possible_durations)
+                    # get the parameters for the looming circle
+                    curr_looming = looms_df.sample()
+                    x = curr_looming["positions"].values[0]
+                    y = HEIGHT // 2
+                    radii = iter(curr_looming["radii_px"].values[0])
 
-                    # check if random radius
-                    if random_radius:
-                        circle_max_radius = random.choice(possible_radius)
-                        F = circle_duration / (1000 / 60)
-                        dR = circle_max_radius / F
-
-                    # if the position is random, generate a random position
-                    if random_position:
-                        x = random.randint(0, random.choice(possible_positions))
-                        y = HEIGHT // 2
-                    else:
-                        x = WIDTH // 2
-                        y = HEIGHT // 2
-
-                    data["looming_pos_x"] = x
-                    data["looming_pos_y"] = y
-                    data["looming_radius"] = circle_max_radius
-                    data["looming_duration"] = circle_duration
+                    # save the parameters for the looming circle
+                    data["looming_pos_x"] = curr_looming["positions"].values[0]
+                    data["looming_pos_y"] = HEIGHT // 2
+                    data["looming_radius"] = curr_looming["radius"].values[0]
+                    data["looming_duration"] = curr_looming["duration"].values[0]
 
                     # wait for all other processes to process the trigger
-                    csv_queue.put(data)
+                    # csv_queue.put(data)
                     trigger = False
 
                 # if the start_loom flag is set, draw the circle
                 if start_loom:
-                    radius += dR
-
-                    # once the circle reaches the max radius, reset the radius and set the start_loom flag to False
-                    if radius > circle_max_radius:
+                    try:
+                        radius = next(radii)
+                    except StopIteration:
                         radius = 0
                         start_loom = False
+                        data["stimulus_end_time"] = time.time()
+                        csv_queue.put(data)
+                        continue
 
                     # draw the circle
                     pygame.draw.circle(screen, circle_color, (x, y), radius)
@@ -180,38 +177,15 @@ def stimuli(
 
 
 if __name__ == "__main__":
-    trigger_event = mp.Event()
-    kill_event = mp.Event()
-    mp_dict = mp.Manager().dict()
-    barrier = mp.Barrier(1)
-    trigger_barrier = mp.Barrier(1)
+    import matplotlib.pyplot as plt
 
-    with open("params.toml", "rb") as f:
-        params = tomllib.load(f)
-    params["folder"] = "./test/"
-    p = mp.Process(
-        target=stimuli,
-        args=(
-            trigger_event,
-            kill_event,
-            mp_dict,
-            barrier,
-            trigger_barrier,
-            params,
-        ),
-    )
-
-    p.start()
-
-    while not kill_event.is_set():
-        user_input = input("Press e to trigger stimulus, q to quit: ")
-        if user_input == "e":
-            trigger_event.set()
-            trigger_barrier.wait()
-        elif user_input == "q":
-            kill_event.set()
-            break
-        else:
-            print("Invalid input.")
-
-    p.join()
+    fig = plt.figure()
+    for duration in [300, 500, 700, 100]:
+        loom = define_looming(duration=duration, max_radius=64, position=WIDTH // 2)
+        plt.plot(
+            np.arange(0, len(loom["radii_px"].iloc[0])),
+            loom["radii_px"].iloc[0],
+            label=duration,
+        )
+    plt.legend()
+    plt.show()
