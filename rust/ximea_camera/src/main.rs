@@ -9,12 +9,14 @@ use std::sync::Arc;
 mod frames;
 mod helpers;
 mod structs;
+mod zmq_handler;
 
 // Imports from local modules
 use frames::frame_handler;
 use helpers::*;
-
 use structs::*;
+use zmq_handler::Subscriber;
+
 fn main() -> Result<(), i32> {
     // set logging level
     if std::env::var_os("RUST_LOG").is_none() {
@@ -30,7 +32,6 @@ fn main() -> Result<(), i32> {
 
     // Parse command line arguments
     let args = Args::parse();
-
     // Open the camera
     let mut cam = xiapi::open_device(Some(0))?;
 
@@ -48,51 +49,13 @@ fn main() -> Result<(), i32> {
 
     // Connect to ZMQ; return error if connection fails
     log::info!("Connecting to ZMQ server at {}", args.address);
-    let handshake = connect_to_socket(&args.req_port, zmq::REQ);
+    let ctx = zmq::Context::new();
+    let socket = Subscriber::new(&ctx, args.sub_port, args.req_port, &args.address);
+    socket.handshake();
+    socket.subscribe("topic");
 
-    // Send ready message to ZMQ over REQ
-    log::info!("Sending ready message to ZMQ PUB");
-    handshake.send("Hello", 0).unwrap();
-    match handshake.recv_string(0) {
-        Ok(Ok(msg)) if &msg == "Welcome " => {
-            log::info!("Handshake successfull");
-        }
-        Ok(Err(e)) => {
-            log::error!("Failed to receive message: {:?}", e);
-        }
-        Err(e) => {
-            log::error!("Failed to receive message: {}", e);
-        }
-        Ok(_) => {
-            log::error!("Handshake failed");
-            return Err(1);
-        }
-    }
-
-    let subscriber = connect_to_socket(&args.sub_port, zmq::SUB);
-
-    // Wait for ready message from socket
-    log::info!("Waiting for ready message from ZMQ PUB");
-    let mut msg = zmq::Message::new();
-
-    // Block until first message, which should be the save folder
-    subscriber.recv(&mut msg, 0).unwrap();
-    let mut save_folder: String = String::new();
-
-    match parse_message(msg.as_str().unwrap()) {
-        MessageType::JsonData(data) => {
-            log::error!("Expected text message, got JSON data: {:?}", data);
-            // shutdown
-            return Err(1);
-        }
-        MessageType::Text(data) => {
-            save_folder = data;
-            log::info!("Got save folder: {}", &save_folder);
-        }
-        MessageType::Empty => {
-            //log::error!("Empty message received");
-        }
-    }
+    // Get save folder
+    let save_folder = args.save_folder;
 
     // spawn writer thread
     let (sender, receiver) = channel::unbounded::<(Arc<ImageData>, MessageType)>();
@@ -106,14 +69,10 @@ fn main() -> Result<(), i32> {
     // start acquisition
     log::info!("Starting acquisition");
     while running.load(Ordering::SeqCst) {
+        let msg = socket.receive(false).unwrap();
+
         // receive message
-        match subscriber.recv(&mut msg, zmq::DONTWAIT) {
-            Ok(_) => log::info!("Received message: {}", msg.as_str().unwrap()),
-            Err(_) => {
-                // do nothing
-            }
-        }
-        let parsed_message = parse_message(msg.as_str().unwrap());
+        let parsed_message = parse_message(&msg);
 
         // check if got "kill" in parsed_message
         if let MessageType::Text(data) = &parsed_message {

@@ -81,9 +81,14 @@ impl Subscriber {
         info!("Subscribed to topic '{}'.", topic);
     }
 
-    pub fn receive(&self) -> String {
-        let msg = self.sub_socket.recv_string(0).unwrap().unwrap();
-        info!("Received message: {}", msg);
-        msg
+    pub fn receive(&self, block: bool) -> Option<String> {
+        let flags = if block { 0 } else { zmq::DONTWAIT };
+        match self.sub_socket.recv_string(flags).unwrap() {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                warn!("Error receiving message: {:?}", e);
+                None
+            }
+        }
     }
 }
