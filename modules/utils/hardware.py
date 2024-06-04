@@ -18,6 +18,7 @@ def initialize_backlighting_power_supply(port="/dev/powersupply", voltage=30):
     try:
         ps = PowerSupply(port=port)
         ps.set_voltage(voltage)
+        return ps
     except RuntimeError:
         raise RuntimeError("Backlight power supply not connected.")
 

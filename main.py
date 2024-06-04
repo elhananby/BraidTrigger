@@ -71,7 +71,7 @@ def main(params_file: str, root_folder: str, args: argparse.Namespace):
 
     # Set power supply voltage (for backlighting)
     if not args.debug:
-        initialize_backlighting_power_supply()
+        ps = initialize_backlighting_power_supply()
 
     # Connect to arduino
     if params["opto_params"].get("active", False):
@@ -212,7 +212,8 @@ def main(params_file: str, root_folder: str, args: argparse.Namespace):
                 csv_writer.write(pos)
 
     except KeyboardInterrupt:
-        pass
+        ps.set_voltage(0)
+        pub.publish("", "kill")
 
 
 if __name__ == "__main__":
