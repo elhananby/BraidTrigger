@@ -15,14 +15,14 @@ import asyncio
 
 from src.utils.csv_writer import CsvWriter
 from src.utils.log_config import setup_logging
-from src.messages import Subscriber
+from src.core.subscriber import AsyncSubscriber
 
 logger = setup_logging(logger_name="VisualStimuli", level="INFO", color="yellow")
 
 # Constants
 SCREEN_WIDTH = 640
 SCREEN_HEIGHT = 128
-os.environ["SDL_VIDEO_WINDOW_POS"] = "%d,%d" % (0, 0)
+os.environ["SDL_VIDEO_WINDOW_POS"] = "0,0"
 
 
 class StimulusType(Enum):
@@ -85,9 +85,7 @@ class LoomingStimulus(Stimulus):
         self.type = config.type
 
     def _get_value(self, value: Any, min_val: int, max_val: int) -> int:
-        if value == "random":
-            return random.randint(min_val, max_val)
-        return int(value)
+        return random.randint(min_val, max_val) if value == "random" else int(value)
 
     def generate_natural_looming(
         self,
@@ -103,15 +101,7 @@ class LoomingStimulus(Stimulus):
         looming_size_on_screen = (
             looming_size_on_screen - np.min(looming_size_on_screen)
         ) / (np.max(looming_size_on_screen) - np.min(looming_size_on_screen))
-        looming_size_on_screen = looming_size_on_screen * max_radius
-        return looming_size_on_screen
-
-    def generate_exponential_looming(
-        self, max_radius: int, duration: int, hz: int = 60
-    ) -> np.ndarray:
-        n_frames = int(duration / (1000 / hz))
-        radii_array = np.logspace(0, np.log10(max_radius), n_frames)
-        return radii_array
+        return looming_size_on_screen * max_radius
 
     def start_expansion(self, heading_direction: Optional[float] = None) -> None:
         self.max_radius = self._get_value(self.config.max_radius, 32, 64)
@@ -119,15 +109,14 @@ class LoomingStimulus(Stimulus):
         if self.position_type == "random":
             self.position = self._get_value("random", 0, SCREEN_WIDTH)
         elif self.position_type == "closed-loop":
-            if heading_direction is not None:
-                self.position = interp_angle(heading_direction)
-                logger.debug(
-                    f" heading_direction: {heading_direction}, position: {self.position}"
-                )
-            else:
-                self.position = self._get_value("random", 0, SCREEN_WIDTH)
+            self.position = (
+                interp_angle(heading_direction)
+                if heading_direction is not None
+                else self._get_value("random", 0, SCREEN_WIDTH)
+            )
         else:
             self.position = float(self.position_type)
+
         if self.type == StimulusType.LOOMING:
             self.radii_array = self.generate_natural_looming(
                 self.max_radius, self.duration
@@ -138,38 +127,37 @@ class LoomingStimulus(Stimulus):
         self.expanding = True
 
     def update(self, screen: pygame.Surface, time_elapsed: int) -> None:
-        if self.expanding:
-            if self.curr_frame < self.n_frames - 1:
-                if self.type == "linear":
-                    self.radius = (self.curr_frame / self.n_frames) * self.max_radius
-                else:
-                    self.radius = self.radii_array[self.curr_frame]
-
-                assert self.position is not None
-                position = wrap_around_position(self.position, SCREEN_WIDTH)
+        if self.expanding and self.curr_frame < self.n_frames - 1:
+            self.radius = (
+                self.radii_array[self.curr_frame]
+                if self.type == StimulusType.LOOMING
+                else (self.curr_frame / self.n_frames) * self.max_radius
+            )
+            assert self.position is not None
+            position = wrap_around_position(self.position, SCREEN_WIDTH)
+            pygame.draw.circle(
+                screen,
+                self.color,
+                (int(position), SCREEN_HEIGHT // 2),
+                int(self.radius),
+            )
+            if position - self.radius < 0:
                 pygame.draw.circle(
                     screen,
                     self.color,
-                    (int(position), SCREEN_HEIGHT // 2),
+                    (int(position + SCREEN_WIDTH), SCREEN_HEIGHT // 2),
                     int(self.radius),
                 )
-                if position - self.radius < 0:
-                    pygame.draw.circle(
-                        screen,
-                        self.color,
-                        (int(position + SCREEN_WIDTH), SCREEN_HEIGHT // 2),
-                        int(self.radius),
-                    )
-                if position + self.radius > SCREEN_WIDTH:
-                    pygame.draw.circle(
-                        screen,
-                        self.color,
-                        (int(position - SCREEN_WIDTH), SCREEN_HEIGHT // 2),
-                        int(self.radius),
-                    )
-                self.curr_frame += 1
-            else:
-                self.expanding = False
+            if position + self.radius > SCREEN_WIDTH:
+                pygame.draw.circle(
+                    screen,
+                    self.color,
+                    (int(position - SCREEN_WIDTH), SCREEN_HEIGHT // 2),
+                    int(self.radius),
+                )
+            self.curr_frame += 1
+        else:
+            self.expanding = False
 
     def get_trigger_info(self) -> Dict[str, Any]:
         return {
@@ -194,10 +182,13 @@ class GratingStimulus(Stimulus):
         pass
 
 
-def connect_to_zmq(pub_port: int = 5556, handshake_port: int = 5557) -> Subscriber:
+async def connect_to_zmq(
+    pub_port: int = 5556, handshake_port: int = 5557
+) -> AsyncSubscriber:
     try:
-        subscriber = Subscriber(pub_port, handshake_port)
-        subscriber.handshake()
+        subscriber = AsyncSubscriber(pub_port, handshake_port)
+        await subscriber.setup()
+        await subscriber.handshake()
         logger.debug("Handshake successful")
         subscriber.subscribe("trigger")
         logger.debug("Subscribed to `trigger` messages")
@@ -229,16 +220,19 @@ def create_stimuli(config: Dict[str, Any]) -> List[Stimulus]:
 async def main_loop(
     screen: pygame.Surface,
     stimuli: List[Stimulus],
-    subscriber: Subscriber,
-    csv_writer: CsvWriter,
+    subscriber: AsyncSubscriber,
+    csv_writer: Optional[CsvWriter],
     standalone: bool,
 ):
     clock = pygame.time.Clock()
-    while True:
+    running = True
+    while running:
         time_elapsed = clock.get_time()
 
         for event in pygame.event.get():
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_k:
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_k:
                 logger.info("Key pressed: K")
                 for stim in stimuli:
                     if isinstance(stim, LoomingStimulus):
@@ -246,10 +240,10 @@ async def main_loop(
 
         if not standalone:
             try:
-                topic, message = await asyncio.to_thread(subscriber.receive)
+                topic, message = await subscriber.receive()
                 if message == "kill":
                     logger.info("Received kill message. Exiting...")
-                    return
+                    running = False
                 elif message:
                     trigger_info = json.loads(message)
                     heading_direction = trigger_info.get("heading_direction")
@@ -261,9 +255,12 @@ async def main_loop(
                             stim.start_expansion(heading_direction)
                             updated_info = stim.get_trigger_info()
                             trigger_info.update(updated_info)
-                            csv_writer.write(trigger_info)
+                            if csv_writer:
+                                csv_writer.write(trigger_info)
             except json.JSONDecodeError as e:
                 logger.error(f"JSON Decode Error: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error while receiving message: {e}")
 
         screen.fill((255, 255, 255))
         for stim in stimuli:
@@ -283,7 +280,7 @@ async def main(config_file: str, base_dir: str, standalone: bool) -> None:
 
         if not standalone:
             csv_writer = CsvWriter(os.path.join(base_dir, "stim.csv"))
-            subscriber = connect_to_zmq()
+            subscriber = await connect_to_zmq()
         else:
             csv_writer = None
             subscriber = None
@@ -299,7 +296,7 @@ async def main(config_file: str, base_dir: str, standalone: bool) -> None:
         if not standalone and csv_writer:
             csv_writer.close()
         if subscriber:
-            subscriber.close()
+            await subscriber.close()
         pygame.quit()
 
 

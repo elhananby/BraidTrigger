@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import os
 from typing import Dict, Any
+import sys
 
 import tomllib
 from contextlib import AsyncExitStack
@@ -63,12 +64,14 @@ async def start_liquid_lens(params: Dict[str, Any], braid_folder: str):
 
 
 async def start_visual_stimuli(params: Dict[str, Any], braid_folder: str):
+    visual_stimuli_script = os.path.join(
+        ROOT_DIR, "src", "visualization", "optimized_visual_stimuli.py"
+    )
     return await asyncio.create_subprocess_exec(
-        "python",
-        os.path.join(ROOT_DIR, "src", "visualization", "visual_stimuli.py"),
-        PARAMS_FILE,
-        "--base_dir",
-        braid_folder,
+        sys.executable,
+        visual_stimuli_script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
 
 
@@ -123,7 +126,7 @@ async def main(params_file: str, root_folder: str, args: argparse.Namespace):
     power_supply = initialize_backlighting_power_supply(
         port=params["arduino_devices"]["power_supply"]
     )
-    power_supply.set_voltage(29)
+    power_supply.set_voltage(VOLTAGE)
 
     async with AsyncExitStack() as stack:
         try:
@@ -167,6 +170,7 @@ async def main(params_file: str, root_folder: str, args: argparse.Namespace):
                 child_processes["visual_stimuli"] = await start_visual_stimuli(
                     params, braid_folder
                 )
+                await asyncio.sleep(1)  # Allow time for initialization
 
             flydra_task = asyncio.create_task(
                 process_flydra_data(
