@@ -7,7 +7,7 @@ import time
 import git
 from tqdm.contrib.concurrent import thread_map
 
-from modules.utils.log_config import setup_logging
+from src.utils.log_config import setup_logging
 
 logger = setup_logging(logger_name="Files", level="INFO", color="green")
 

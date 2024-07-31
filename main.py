@@ -1,261 +1,215 @@
 import argparse
-import json
+import asyncio
 import os
-import subprocess
-import time
-import tomllib
+from typing import Dict, Any
 
-from modules.messages import Publisher
-from modules.utils.csv_writer import CsvWriter
-from modules.utils.files import (
+import tomllib
+from contextlib import AsyncExitStack
+
+from src.core.flydra_proxy import AsyncFlydra2Proxy
+from src.core.publisher import AsyncPublisher
+from src.utils.csv_writer import CsvWriter
+from src.utils.file_operations import (
     check_braid_running,
     copy_files_to_folder,
     get_video_output_folder,
 )
-from modules.utils.flydra_proxy import Flydra2Proxy
-from modules.utils.hardware import create_arduino_device, PowerSupply
-from modules.utils.log_config import setup_logging
-from modules.utils.opto import check_position, trigger_opto
-from modules.utils.trajectory import RealTimeHeadingCalculator
+from src.devices.powersupply import initialize_backlighting_power_supply
+from src.utils.log_config import setup_logging
+from src.devices.opto import OptoTrigger
+from src.processing.data_processor import (
+    DataProcessor,
+    TrajectoryData,
+    TriggerConfig,
+    OptoConfig,
+)
+from src.processing.trajectory import RealTimeHeadingCalculator
+from src.devices.cameras.ximea_camera import XimeaCamera
 
-# Get the root directory of the project
-root_dir = os.path.abspath(os.path.dirname(__file__))
-
-# Set the PYTHONPATH environment variable
-env = os.environ.copy()
-env["PYTHONPATH"] = root_dir
-
-# Setup logger
 logger = setup_logging(logger_name="Main", level="INFO")
 
+ROOT_DIR = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+PARAMS_FILE = os.path.join(ROOT_DIR, "params.toml")
+ROOT_FOLDER = "/home/buchsbaum/mnt/DATA/Experiments/"
+VOLTAGE = 23.5
 
-def main(params_file: str, root_folder: str, args: argparse.Namespace):
-    """Main BraidTrigger function. Starts up all processes and triggers.
-    Loop over data incoming from the flydra2 proxy and tests if a trigger should be sent.
 
-    Args:
-        params_file (str): a path to the params.toml file
-        root_folder (str): the root folder where the experiment folder will be created
-    """
-    # Load params
-    with open(params_file, "rb") as f:
-        params = tomllib.load(f)
+async def start_ximea_camera(params: Dict[str, Any], braid_folder: str):
+    video_save_folder = get_video_output_folder(braid_folder)
+    camera_params = params["highspeed"]["parameters"]
+    return await XimeaCamera.create(
+        save_folder=video_save_folder,
+        fps=camera_params["fps"],
+        exposure_time=camera_params["exposure_time"],
+        pre_trigger_mode=camera_params["pre_trigger_mode"],
+        time_before=camera_params["time_before"],
+        time_after=camera_params["time_after"],
+        sensor_readout_mode=camera_params["sensor_readout_mode"],
+    )
 
-    # Check if braidz is running (see if folder was created)
-    params["folder"] = check_braid_running(root_folder, args.debug)
-    braid_folder = params["folder"]
 
-    # Copy the params file to the experiment folder
-    copy_files_to_folder(braid_folder, params_file)
+async def start_liquid_lens(params: Dict[str, Any], braid_folder: str):
+    return await asyncio.create_subprocess_exec(
+        "libs/lens_controller/target/release/lens_controller",
+        "--braid-url",
+        "http://10.40.80.6:8397/",
+        "--lens-driver-port",
+        params["arduino_devices"]["liquid_lens"],
+        "--update-interval-ms",
+        "20",
+        "--save-folder",
+        braid_folder,
+    )
 
-    # Set power supply voltage (for backlighting)
-    if not args.debug:
-        ps = PowerSupply(port="/dev/powersupply")
-        ps.set_voltage(29)
 
-    # Connect to arduino
-    if params["opto_params"].get("active", False):
-        opto_trigger_board = create_arduino_device(port="/dev/ttyACM1")
+async def start_visual_stimuli(params: Dict[str, Any], braid_folder: str):
+    return await asyncio.create_subprocess_exec(
+        "python",
+        os.path.join(ROOT_DIR, "src", "visualization", "visual_stimuli.py"),
+        PARAMS_FILE,
+        "--base_dir",
+        braid_folder,
+    )
 
-    # Connect to flydra2 proxy
-    braid_proxy = Flydra2Proxy()
 
-    # create data publisher
-    pub = Publisher(pub_port=5556, handshake_port=5557)
-
-    child_processes = {}
-    if args.plot:
-        import zmq
-
-        context = zmq.Context()
-        pub_plot = context.socket(zmq.PUB)
-        pub_plot.bind("tcp://*:12345")
-        subprocess.Popen(["python", "modules/plotting.py"])
-
-    # Connect to cameras
-    if params["highspeed"].get("active", False):
-        logger.info("Opening highspeed camera.")
-        params["video_save_folder"] = get_video_output_folder(braid_folder)
-        video_save_folder = params["video_save_folder"]
-        child_processes["ximea_camera"] = subprocess.Popen(
-            [
-                "libs/ximea_camera/target/release/ximea_camera",
-                "--save-folder",
-                f"{video_save_folder}",
-                "--fps",
-                "500",
-                "--height",
-                "2016",
-                "--width",
-                "2016",
-                "--offset-x",
-                "1056",
-                "--offset-y",
-                "170",
-            ]
-        )
-
-        pub.wait_for_subscriber()
-
-        # start liquid lens process
-        child_processes["liquid_lens"] = subprocess.Popen(
-            [
-                "libs/lens_controller/target/release/lens_controller",
-                "--braid-url",
-                "http://10.40.80.6:8397/",
-                "--lens-driver-port",
-                "/dev/optotune_ld",
-                "--update-interval-ms",
-                "20",
-                "--save-folder",
-                f"{braid_folder}",
-            ],
-            env=env,
-        )
-        logger.info("Highspeed camera connected.")
-
-    # check if any visual stimuli is active and start the visual stimuli process
-    if any(
-        [value.get("active", False) for key, value in params["stim_params"].items()]
-    ):
-        logger.info("Starting visual stimuli process.")
-        child_processes["visual_stimuli"] = subprocess.Popen(
-            [
-                "python",
-                "./modules/visual_stimuli.py",
-                f"{params_file}",
-                "--base_dir",
-                f"{braid_folder}",
-            ],
-            env=env,
-        )
-
-        pub.wait_for_subscriber()
-        logger.info("Visual stimuli process connected.")
-
-    trigger_params = params["trigger_params"]
-    opto_params = params["opto_params"]
-
-    csv_writer = CsvWriter(os.path.join(braid_folder, "opto.csv"))
-
-    # initialize main loop parameters
-    obj_ids = []
-    obj_birth_times = {}
-    headings = {}
-    last_trigger_time = time.time()
-    ntrig = 0
-
-    # Start main loop
-    logger.info("Starting main loop.")
-    start_time = time.time()
+async def process_flydra_data(
+    proxy: AsyncFlydra2Proxy,
+    data_processor: DataProcessor,
+    trajectory_data: TrajectoryData,
+    trigger_config: TriggerConfig,
+    opto_config: OptoConfig,
+    max_runtime: float,
+):
+    start_time = asyncio.get_event_loop().time()
     try:
-        for data in braid_proxy.data_stream():
-            if (time.time() - start_time) >= params["max_runtime"] * 3600:
+        async for data in proxy.data_stream():
+            current_time = asyncio.get_event_loop().time()
+            if (current_time - start_time) >= max_runtime:
                 break
-
-            tcall = time.time()
 
             try:
                 msg_dict = data["msg"]
             except KeyError:
                 continue
 
-            # Debug log for message before publishing
-            # logger.debug(f"Publishing message to 'lens': {msg_dict}")
-            # pub.publish(json.dumps(msg_dict), "lens")
-
             if "Birth" in msg_dict:
                 curr_obj_id = msg_dict["Birth"]["obj_id"]
-                obj_ids.append(curr_obj_id)
-                obj_birth_times[curr_obj_id] = tcall
-                headings[curr_obj_id] = RealTimeHeadingCalculator()
-                continue
-
+                trajectory_data.obj_ids.append(curr_obj_id)
+                trajectory_data.birth_times[curr_obj_id] = current_time
+                trajectory_data.headings[curr_obj_id] = RealTimeHeadingCalculator()
             elif "Update" in msg_dict:
-                curr_obj_id = msg_dict["Update"]["obj_id"]
-
-                if curr_obj_id not in headings:
-                    headings[curr_obj_id] = RealTimeHeadingCalculator()
-                headings[curr_obj_id].add_data_point(
-                    msg_dict["Update"]["xvel"],
-                    msg_dict["Update"]["yvel"],
-                    msg_dict["Update"]["zvel"],
+                await data_processor.handle_update(
+                    msg_dict, trajectory_data, trigger_config, opto_config
                 )
-
-                if curr_obj_id not in obj_ids:
-                    obj_ids.append(curr_obj_id)
-                    obj_birth_times[curr_obj_id] = tcall
-                    continue
-
             elif "Death" in msg_dict:
                 curr_obj_id = msg_dict["Death"]
-                if curr_obj_id in obj_ids:
-                    obj_ids.remove(curr_obj_id)
-                continue
+                if curr_obj_id in trajectory_data.obj_ids:
+                    trajectory_data.obj_ids.remove(curr_obj_id)
 
+    except asyncio.CancelledError:
+        logger.info("Flydra data processing cancelled")
+    except Exception as e:
+        logger.error(f"Error in Flydra data processing: {e}")
+
+
+async def main(params_file: str, root_folder: str, args: argparse.Namespace):
+    with open(params_file, "rb") as f:
+        params = tomllib.load(f)
+
+    braid_folder = check_braid_running(root_folder, args.debug)
+    params["folder"] = braid_folder
+    copy_files_to_folder(braid_folder, params_file)
+
+    power_supply = initialize_backlighting_power_supply(
+        port=params["arduino_devices"]["power_supply"]
+    )
+    power_supply.set_voltage(29)
+
+    async with AsyncExitStack() as stack:
+        try:
+            flydra_proxy = await stack.enter_async_context(AsyncFlydra2Proxy())
+            publisher = await stack.enter_async_context(
+                AsyncPublisher(pub_port=5556, handshake_port=5557)
+            )
+
+            csv_writer = CsvWriter(os.path.join(braid_folder, "opto.csv"))
+            await stack.enter_async_context(csv_writer)
+
+            data_processor = DataProcessor(publisher, csv_writer)
+            trajectory_data = TrajectoryData([], {}, {})
+            trigger_config = TriggerConfig(params["trigger_params"], 0, 0)
+
+            if params["opto_params"]["active"]:
+                opto_trigger = OptoTrigger(
+                    params["arduino_devices"]["opto_trigger"],
+                    9600,
+                    params["opto_params"],
+                )
+                await stack.enter_async_context(opto_trigger)
+                opto_config = OptoConfig(params["opto_params"], opto_trigger)
             else:
-                continue
+                opto_config = OptoConfig(params["opto_params"], None)
 
-            if (tcall - obj_birth_times[curr_obj_id]) < trigger_params[
-                "min_trajectory_time"
-            ]:
-                continue
+            child_processes = {}
+            if params["highspeed"]["active"]:
+                child_processes["ximea_camera"] = await start_ximea_camera(
+                    params, braid_folder
+                )
+                child_processes["liquid_lens"] = await start_liquid_lens(
+                    params, braid_folder
+                )
 
-            if tcall - last_trigger_time < trigger_params["min_trigger_interval"]:
-                continue
+            if any(
+                params["stim_params"][stim].get("active", False)
+                for stim in params["stim_params"]
+                if stim != "window"
+            ):
+                child_processes["visual_stimuli"] = await start_visual_stimuli(
+                    params, braid_folder
+                )
 
-            pos = msg_dict["Update"]
+            flydra_task = asyncio.create_task(
+                process_flydra_data(
+                    flydra_proxy,
+                    data_processor,
+                    trajectory_data,
+                    trigger_config,
+                    opto_config,
+                    params["max_runtime"] * 3600,
+                )
+            )
 
-            if args.plot:
-                logger.debug(f"Publishing message to 'plot': {pos}")
-                pub_plot.send_string(json.dumps(pos))
+            try:
+                await flydra_task
+            except asyncio.TimeoutError:
+                logger.info(
+                    f"Maximum runtime of {params['max_runtime']} hours reached."
+                )
+            finally:
+                await publisher.publish("trigger", "kill")
+                await publisher.publish("lens", "kill")
 
-            if check_position(pos, trigger_params):
-                ntrig += 1
-                last_trigger_time = tcall
+                for process in child_processes.values():
+                    if isinstance(process, asyncio.subprocess.Process):
+                        process.terminate()
+                        await process.wait()
+                    else:
+                        await process.stop()
 
-                pos["trigger_time"] = last_trigger_time
-                pos["ntrig"] = ntrig
-                pos["main_timestamp"] = tcall
-                pos["heading_direction"] = headings[curr_obj_id].calculate_heading()
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+        finally:
+            power_supply.set_voltage(0)
+            power_supply.close()
 
-                if params["opto_params"].get("active", False):
-                    logger.info("Triggering opto.")
-                    pos = trigger_opto(opto_trigger_board, opto_params, pos)
-
-                logger.debug(f"Publishing message to 'trigger': {pos}")
-                pub.publish(json.dumps(pos), "trigger")
-                csv_writer.write(pos)
-
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received, shutting down.")
-
-    logger.info("Sending kill message to all processes.")
-    pub.publish("trigger", "kill")
-    pub.publish("lens", "kill")
-
-    logger.info("Closing csv_writer.")
-    csv_writer.close()
-
-    logger.info("Shutting down backlighting power supply.")
-    ps.set_voltage(0)
-    ps.dev.close()
-
-    logger.info("Closing publisher sockets.")
-    pub.close()
+    logger.info("Main function completed.")
 
 
 if __name__ == "__main__":
-    # Parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true", default=False)
     parser.add_argument("--plot", action="store_true", default=False)
     args = parser.parse_args()
 
-    # Start main function
     logger.info("Starting main function.")
-    main(
-        params_file="./params.toml",
-        root_folder="/home/buchsbaum/mnt/DATA/Experiments/",
-        args=args,
-    )
+    asyncio.run(main(PARAMS_FILE, ROOT_FOLDER, args))

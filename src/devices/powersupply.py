@@ -14,6 +14,9 @@ import time
 
 import numpy as np
 import serial
+from src.utils.log_config import setup_logging
+
+logger = setup_logging(logger_name="Hardware", level="INFO")
 
 PORT = "/dev/ttyACM1"
 _CONNECTION_SETTINGS = {
@@ -129,17 +132,29 @@ class PowerSupply:
         self.write(f"VSET1:{voltage}")
 
 
-def test():
-    with PowerSupply() as psu:
-        print(f"Voltage {psu.get_actual_voltage():.2f}")
-        print(f"Current {psu.get_actual_current():.2f}")
-        print("Set voltage to 2")
-        psu.set_voltage(2)
-        print(f"Voltage {psu.get_actual_voltage():.2f}")
-        print(f"Current {psu.get_actual_current():.2f}")
-        print("Set voltage to 1")
-        psu.set_voltage(1)
+def initialize_backlighting_power_supply(
+    port: str = "/dev/powersupply", voltage: float = 30.0
+) -> PowerSupply:
+    """
+    Initializes the backlighting power supply.
 
+    Args:
+        port (str): The port of the power supply. Defaults to "/dev/powersupply".
+        voltage (float): The voltage to set on the power supply. Defaults to 30.0.
 
-if __name__ == "__main__":
-    test()
+    Returns:
+        PowerSupply: The initialized PowerSupply object.
+
+    Raises:
+        RuntimeError: If the backlight power supply is not connected.
+    """
+    try:
+        ps = PowerSupply(port=port)
+        ps.set_voltage(voltage)
+        logger.info(
+            f"Backlighting power supply initialized at port {port} with voltage {voltage}V"
+        )
+        return ps
+    except Exception as e:
+        logger.error(f"Failed to initialize backlight power supply: {e}")
+        raise RuntimeError("Backlight power supply not connected.") from e
